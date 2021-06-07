@@ -3,7 +3,7 @@ use std::{
     sync::{
         atomic::AtomicBool,
         mpsc::{channel, sync_channel, Sender, SyncSender},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -24,16 +24,14 @@ struct RunDetails {
 }
 
 fn perform_queries(
-    ch: SyncSender<RunDetails>,
     init_done: SyncSender<()>,
-    informer_sender: Sender<u128>,
+    informer_sender: Sender<RunDetails>,
     finished: Arc<AtomicBool>,
     nameserver: IpAddr,
     host: Name,
     timeout: Duration,
     lock: Arc<Mutex<()>>,
 ) {
-    eprintln!("Spawning thread");
     let mut resolver_config = ResolverConfig::new();
     resolver_config.add_name_server(NameServerConfig {
         socket_addr: SocketAddr::new(nameserver, 53),
@@ -55,7 +53,7 @@ fn perform_queries(
         duration: 0,
     };
 
-    let details = Arc::new(RwLock::new(ret));
+    let details = Arc::new(Mutex::new(ret));
 
     let informer_details = details.clone();
     let informer_finished_parent = Arc::new(AtomicBool::new(false));
@@ -65,15 +63,16 @@ fn perform_queries(
         let tick = std::time::Duration::new(1, 0);
         while !informer_finished.load(std::sync::atomic::Ordering::Relaxed) {
             thread::sleep(tick);
-            informer_sender
-                .send(informer_details.read().unwrap().duration)
-                .unwrap();
+            let mut details = informer_details.lock().unwrap();
+            informer_sender.send(details.clone()).unwrap();
+            details.successes = 0;
+            details.failures = 0;
+            details.duration = 0;
         }
     });
 
     init_done.send(()).unwrap();
     drop(lock.lock().unwrap());
-    eprintln!("Initiating requests");
 
     while !finished.load(std::sync::atomic::Ordering::Relaxed) {
         let now = Instant::now();
@@ -81,21 +80,19 @@ fn perform_queries(
             .lookup(host.clone(), trust_dns_resolver::proto::rr::RecordType::A)
             .is_ok()
         {
-            let mut writer = details.write().unwrap();
+            let mut writer = details.lock().unwrap();
             writer.successes += 1;
             let previous = writer.duration;
             let current = Instant::now().duration_since(now).as_nanos();
             writer.duration = (current + previous) / 2;
         } else {
-            let mut writer = details.write().unwrap();
+            let mut writer = details.lock().unwrap();
             writer.failures += 1
         }
     }
 
     informer_finished_parent.store(true, std::sync::atomic::Ordering::Release);
     informer.join().unwrap();
-
-    ch.send(details.write().unwrap().to_owned()).unwrap();
 }
 
 #[derive(FromArgs, Clone, Debug)]
@@ -144,7 +141,6 @@ fn main() {
     let mg = lock.lock().unwrap();
 
     for _ in 0..args.cpus {
-        let s = s.clone();
         let init_s = init_s.clone();
         let finished = finished.clone();
         let nameserver = args.nameserver.clone();
@@ -154,7 +150,7 @@ fn main() {
         let inf_s = inf_s.clone();
 
         handles.push(std::thread::spawn(move || {
-            perform_queries(s, init_s, inf_s, finished, nameserver, host, timeout, lock)
+            perform_queries(init_s, inf_s, finished, nameserver, host, timeout, lock)
         }));
     }
 
@@ -163,15 +159,41 @@ fn main() {
     }
 
     let informer = thread::spawn(move || {
-        let mut orig = 0;
+        let mut totals = RunDetails {
+            successes: 0,
+            failures: 0,
+            duration: 0,
+        };
+
         let mut start = Instant::now();
-        while let Ok(duration) = inf_r.recv() {
-            orig = (duration + orig) / 2;
+        let mut temp_total = totals.clone();
+        while let Ok(details) = inf_r.recv() {
+            totals.duration = (details.duration + totals.duration) / 2;
+            totals.successes += details.successes;
+            totals.failures += details.failures;
+
+            temp_total.duration = (details.duration + totals.duration) / 2;
+            temp_total.successes += details.successes;
+            temp_total.failures += details.failures;
             if Instant::now().duration_since(start).as_secs() > 1 {
-                eprintln!("1s latency: {:?}", Duration::from_nanos(orig as u64));
-                start = Instant::now()
+                eprintln!(
+                    "1s latency: {:?} | Successes: {} | Failures: {} | Total Req: {}",
+                    Duration::from_nanos(temp_total.duration as u64),
+                    temp_total.successes,
+                    temp_total.failures,
+                    temp_total.successes + temp_total.failures,
+                );
+
+                start = Instant::now();
+                temp_total = RunDetails {
+                    successes: 0,
+                    failures: 0,
+                    duration: 0,
+                };
             }
         }
+
+        s.send(totals).unwrap()
     });
 
     drop(mg);
@@ -179,27 +201,14 @@ fn main() {
     std::thread::sleep(Duration::new(args.time_secs, 0));
     finished.store(true, std::sync::atomic::Ordering::Release);
 
-    let mut overall = RunDetails {
-        successes: 0,
-        failures: 0,
-        duration: 0,
-    };
-
-    for _ in 0..args.cpus {
-        if let Ok(details) = r.recv() {
-            overall.successes += details.successes;
-            overall.failures += details.failures;
-        } else {
-            eprintln!("Some statistics never made it to the main thread!");
-        }
-    }
-
     for handle in handles {
         handle.join().unwrap()
     }
 
     drop(inf_s);
     informer.join().unwrap();
+
+    let overall = r.recv().unwrap();
 
     println!("Nameserver: {}", args.nameserver);
     println!("Host: {}", args.host);
