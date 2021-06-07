@@ -17,6 +17,17 @@ use trust_dns_resolver::{
 
 use argh::FromArgs;
 
+#[derive(Debug, Clone)]
+struct QueryConfig {
+    init_done: SyncSender<()>,
+    informer_sender: Sender<RunDetails>,
+    finished: Arc<AtomicBool>,
+    nameserver: IpAddr,
+    host: Name,
+    timeout: Duration,
+    lock: Arc<Mutex<()>>,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RunDetails {
     successes: u64,
@@ -50,18 +61,10 @@ impl AddAssign<RunDetails> for RunDetails {
     }
 }
 
-fn perform_queries(
-    init_done: SyncSender<()>,
-    informer_sender: Sender<RunDetails>,
-    finished: Arc<AtomicBool>,
-    nameserver: IpAddr,
-    host: Name,
-    timeout: Duration,
-    lock: Arc<Mutex<()>>,
-) {
+fn perform_queries(qc: QueryConfig) {
     let mut resolver_config = ResolverConfig::new();
     resolver_config.add_name_server(NameServerConfig {
-        socket_addr: SocketAddr::new(nameserver, 53),
+        socket_addr: SocketAddr::new(qc.nameserver, 53),
         protocol: trust_dns_resolver::config::Protocol::Udp,
         tls_dns_name: None,
         trust_nx_responses: true,
@@ -70,7 +73,7 @@ fn perform_queries(
     let mut opts = ResolverOpts::default();
     opts.rotate = false;
     opts.cache_size = 0;
-    opts.timeout = timeout;
+    opts.timeout = qc.timeout;
 
     let resolver = Resolver::new(resolver_config, opts).unwrap();
 
@@ -80,6 +83,7 @@ fn perform_queries(
     let informer_details = details.clone();
     let informer_finished_parent = Arc::new(AtomicBool::new(false));
     let informer_finished = informer_finished_parent.clone();
+    let informer_sender = qc.informer_sender.clone();
 
     let informer = thread::spawn(move || {
         let tick = std::time::Duration::new(1, 0);
@@ -91,13 +95,16 @@ fn perform_queries(
         }
     });
 
-    init_done.send(()).unwrap();
-    drop(lock.lock().unwrap());
+    qc.init_done.send(()).unwrap();
+    drop(qc.lock.lock().unwrap());
 
-    while !finished.load(std::sync::atomic::Ordering::Relaxed) {
+    while !qc.finished.load(std::sync::atomic::Ordering::Relaxed) {
         let now = Instant::now();
         if resolver
-            .lookup(host.clone(), trust_dns_resolver::proto::rr::RecordType::A)
+            .lookup(
+                qc.host.clone(),
+                trust_dns_resolver::proto::rr::RecordType::A,
+            )
             .is_ok()
         {
             let mut writer = details.lock().unwrap();
@@ -161,17 +168,17 @@ fn main() {
     let mg = lock.lock().unwrap();
 
     for _ in 0..args.cpus {
-        let init_s = init_s.clone();
-        let finished = finished.clone();
-        let nameserver = args.nameserver.clone();
-        let host = args.host.clone();
-        let timeout = Duration::new(0, args.timeout);
-        let lock = lock.clone();
-        let inf_s = inf_s.clone();
+        let qc = QueryConfig {
+            init_done: init_s.clone(),
+            informer_sender: inf_s.clone(),
+            finished: finished.clone(),
+            nameserver: args.nameserver.clone(),
+            host: args.host.clone(),
+            timeout: Duration::new(0, args.timeout),
+            lock: lock.clone(),
+        };
 
-        handles.push(std::thread::spawn(move || {
-            perform_queries(init_s, inf_s, finished, nameserver, host, timeout, lock)
-        }));
+        handles.push(std::thread::spawn(move || perform_queries(qc)));
     }
 
     for _ in 0..args.cpus {
