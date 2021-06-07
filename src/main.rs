@@ -3,7 +3,7 @@ use std::{
     sync::{
         atomic::AtomicBool,
         mpsc::{sync_channel, SyncSender},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -22,10 +22,14 @@ struct RunDetails {
 
 fn perform_queries(
     ch: SyncSender<RunDetails>,
+    init_done: SyncSender<()>,
     finished: Arc<AtomicBool>,
     nameserver: IpAddr,
     host: Name,
+    timeout: Duration,
+    lock: Arc<Mutex<()>>,
 ) {
+    eprintln!("Spawning thread");
     let mut resolver_config = ResolverConfig::new();
     resolver_config.add_name_server(NameServerConfig {
         socket_addr: SocketAddr::new(nameserver, 53),
@@ -37,6 +41,7 @@ fn perform_queries(
     let mut opts = ResolverOpts::default();
     opts.rotate = false;
     opts.cache_size = 0;
+    opts.timeout = timeout;
 
     let resolver = Resolver::new(resolver_config, opts).unwrap();
 
@@ -44,6 +49,10 @@ fn perform_queries(
         successes: 0,
         failures: 0,
     };
+
+    init_done.send(()).unwrap();
+    drop(lock.lock().unwrap());
+    eprintln!("Initiating requests");
 
     while !finished.load(std::sync::atomic::Ordering::Relaxed) {
         if resolver
@@ -64,14 +73,6 @@ fn perform_queries(
 struct CLIArguments {
     #[argh(
         option,
-        short = 'c',
-        description = "number of threads to spawn / cpu",
-        default = "10"
-    )]
-    concurrency_factor: usize,
-
-    #[argh(
-        option,
         short = 't',
         description = "time in seconds to run the test",
         default = "60"
@@ -86,6 +87,13 @@ struct CLIArguments {
     )]
     cpus: usize,
 
+    #[argh(
+        option,
+        description = "duration to wait (in ns) before considering a request failed",
+        default = "500000"
+    )]
+    timeout: u32,
+
     #[argh(positional)]
     nameserver: IpAddr,
 
@@ -96,21 +104,33 @@ struct CLIArguments {
 fn main() {
     let args: CLIArguments = argh::from_env();
 
-    let thread_count = args.cpus * args.concurrency_factor;
     let mut handles = Vec::new();
-    let (s, r) = sync_channel(thread_count);
+    let (s, r) = sync_channel(args.cpus);
+    let (init_s, init_r) = sync_channel(args.cpus);
     let finished = Arc::new(AtomicBool::new(false));
+    let lock = Arc::new(Mutex::new(()));
 
-    for _ in 0..thread_count {
+    let mg = lock.lock().unwrap();
+
+    for _ in 0..args.cpus {
         let s = s.clone();
+        let init_s = init_s.clone();
         let finished = finished.clone();
         let nameserver = args.nameserver.clone();
         let host = args.host.clone();
+        let timeout = Duration::new(0, args.timeout);
+        let lock = lock.clone();
 
         handles.push(std::thread::spawn(move || {
-            perform_queries(s, finished, nameserver, host)
+            perform_queries(s, init_s, finished, nameserver, host, timeout, lock)
         }));
     }
+
+    for _ in 0..args.cpus {
+        init_r.recv().unwrap();
+    }
+
+    drop(mg);
 
     std::thread::sleep(Duration::new(args.time_secs, 0));
     finished.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -120,7 +140,7 @@ fn main() {
         failures: 0,
     };
 
-    for _ in 0..thread_count {
+    for _ in 0..args.cpus {
         if let Ok(details) = r.recv() {
             overall.successes += details.successes;
             overall.failures += details.failures;
@@ -136,7 +156,6 @@ fn main() {
     println!("Nameserver: {}", args.nameserver);
     println!("Host: {}", args.host);
     println!("CPUs Used: {}", args.cpus);
-    println!("Total threads consumed: {}", thread_count);
     println!("Successes: {}", overall.successes);
     println!("Failures: {}", overall.failures);
     println!(
