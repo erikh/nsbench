@@ -1,6 +1,6 @@
 # nsbench: a tool I cobbled together to load test/benchmark DNS servers
 
-Also a great tutorial on thread-based concurrency in rust!
+Also a great way to learn thread-based concurrency in rust!
 
 I don't really guarantee anything about this software. It can generate a lot of load, though! I built it to help me evaluate performance issues with [zeronsd](https://github.com/zerotier/zeronsd).
 
