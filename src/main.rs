@@ -2,10 +2,11 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::AtomicBool,
-        mpsc::{sync_channel, SyncSender},
-        Arc, Mutex,
+        mpsc::{channel, sync_channel, Sender, SyncSender},
+        Arc, Mutex, RwLock,
     },
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use trust_dns_resolver::{
@@ -15,14 +16,17 @@ use trust_dns_resolver::{
 
 use argh::FromArgs;
 
+#[derive(Clone, Copy, Debug)]
 struct RunDetails {
     successes: u64,
     failures: u64,
+    duration: u128,
 }
 
 fn perform_queries(
     ch: SyncSender<RunDetails>,
     init_done: SyncSender<()>,
+    informer_sender: Sender<u128>,
     finished: Arc<AtomicBool>,
     nameserver: IpAddr,
     host: Name,
@@ -45,27 +49,53 @@ fn perform_queries(
 
     let resolver = Resolver::new(resolver_config, opts).unwrap();
 
-    let mut details = RunDetails {
+    let ret = RunDetails {
         successes: 0,
         failures: 0,
+        duration: 0,
     };
+
+    let details = Arc::new(RwLock::new(ret));
+
+    let informer_details = details.clone();
+    let informer_finished_parent = Arc::new(AtomicBool::new(false));
+    let informer_finished = informer_finished_parent.clone();
+
+    let informer = thread::spawn(move || {
+        let tick = std::time::Duration::new(1, 0);
+        while !informer_finished.load(std::sync::atomic::Ordering::Relaxed) {
+            thread::sleep(tick);
+            informer_sender
+                .send(informer_details.read().unwrap().duration)
+                .unwrap();
+        }
+    });
 
     init_done.send(()).unwrap();
     drop(lock.lock().unwrap());
     eprintln!("Initiating requests");
 
     while !finished.load(std::sync::atomic::Ordering::Relaxed) {
+        let now = Instant::now();
         if resolver
             .lookup(host.clone(), trust_dns_resolver::proto::rr::RecordType::A)
             .is_ok()
         {
-            details.successes += 1
+            let mut writer = details.write().unwrap();
+            writer.successes += 1;
+            let previous = writer.duration;
+            let current = Instant::now().duration_since(now).as_nanos();
+            writer.duration = (current + previous) / 2;
         } else {
-            details.failures += 1
+            let mut writer = details.write().unwrap();
+            writer.failures += 1
         }
     }
 
-    ch.send(details).unwrap()
+    informer_finished_parent.store(true, std::sync::atomic::Ordering::Release);
+    informer.join().unwrap();
+
+    ch.send(details.write().unwrap().to_owned()).unwrap();
 }
 
 #[derive(FromArgs, Clone, Debug)]
@@ -107,6 +137,7 @@ fn main() {
     let mut handles = Vec::new();
     let (s, r) = sync_channel(args.cpus);
     let (init_s, init_r) = sync_channel(args.cpus);
+    let (inf_s, inf_r) = channel();
     let finished = Arc::new(AtomicBool::new(false));
     let lock = Arc::new(Mutex::new(()));
 
@@ -120,9 +151,10 @@ fn main() {
         let host = args.host.clone();
         let timeout = Duration::new(0, args.timeout);
         let lock = lock.clone();
+        let inf_s = inf_s.clone();
 
         handles.push(std::thread::spawn(move || {
-            perform_queries(s, init_s, finished, nameserver, host, timeout, lock)
+            perform_queries(s, init_s, inf_s, finished, nameserver, host, timeout, lock)
         }));
     }
 
@@ -130,14 +162,27 @@ fn main() {
         init_r.recv().unwrap();
     }
 
+    let informer = thread::spawn(move || {
+        let mut orig = 0;
+        let mut start = Instant::now();
+        while let Ok(duration) = inf_r.recv() {
+            orig = (duration + orig) / 2;
+            if Instant::now().duration_since(start).as_secs() > 1 {
+                eprintln!("1s latency: {:?}", Duration::from_nanos(orig as u64));
+                start = Instant::now()
+            }
+        }
+    });
+
     drop(mg);
 
     std::thread::sleep(Duration::new(args.time_secs, 0));
-    finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    finished.store(true, std::sync::atomic::Ordering::Release);
 
     let mut overall = RunDetails {
         successes: 0,
         failures: 0,
+        duration: 0,
     };
 
     for _ in 0..args.cpus {
@@ -152,6 +197,9 @@ fn main() {
     for handle in handles {
         handle.join().unwrap()
     }
+
+    drop(inf_s);
+    informer.join().unwrap();
 
     println!("Nameserver: {}", args.nameserver);
     println!("Host: {}", args.host);
