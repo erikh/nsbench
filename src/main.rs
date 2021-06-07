@@ -1,6 +1,5 @@
 use std::{
     net::{IpAddr, SocketAddr},
-    str::FromStr,
     sync::{
         atomic::AtomicBool,
         mpsc::{sync_channel, SyncSender},
@@ -13,6 +12,8 @@ use trust_dns_resolver::{
     config::{NameServerConfig, ResolverConfig, ResolverOpts},
     Name, Resolver,
 };
+
+use argh::FromArgs;
 
 struct RunDetails {
     successes: u64,
@@ -58,31 +59,60 @@ fn perform_queries(
     ch.send(details).unwrap()
 }
 
+#[derive(FromArgs, Clone, Debug)]
+#[argh(description = "Nameserver benchmarking/flooding tool")]
+struct CLIArguments {
+    #[argh(
+        option,
+        short = 'c',
+        description = "number of threads to spawn / cpu",
+        default = "10"
+    )]
+    concurrency_factor: usize,
+
+    #[argh(
+        option,
+        short = 't',
+        description = "time in seconds to run the test",
+        default = "60"
+    )]
+    time_secs: u64,
+
+    #[argh(
+        option,
+        short = 'l',
+        description = "limit the number of CPUs (default off)",
+        default = "num_cpus::get()"
+    )]
+    cpus: usize,
+
+    #[argh(positional)]
+    nameserver: IpAddr,
+
+    #[argh(positional)]
+    host: Name,
+}
+
 fn main() {
-    let concurrency_factor = 100;
-    let time_secs = 60;
-    let cpus = num_cpus::get_physical();
-    let thread_count = cpus * concurrency_factor;
+    let args: CLIArguments = argh::from_env();
+
+    let thread_count = args.cpus * args.concurrency_factor;
     let mut handles = Vec::new();
     let (s, r) = sync_channel(thread_count);
     let finished = Arc::new(AtomicBool::new(false));
 
-    let nameserver = IpAddr::from_str("10.147.19.234").expect("cannot parse nameserver IP");
-    // let nameserver = IpAddr::from_str("10.0.0.5").expect("cannot parse nameserver IP");
-    let host = Name::from_str("seafile.home").expect("Cannot parse DNS name");
-
     for _ in 0..thread_count {
         let s = s.clone();
         let finished = finished.clone();
-        let nameserver = nameserver.clone();
-        let host = host.clone();
+        let nameserver = args.nameserver.clone();
+        let host = args.host.clone();
 
         handles.push(std::thread::spawn(move || {
             perform_queries(s, finished, nameserver, host)
         }));
     }
 
-    std::thread::sleep(Duration::new(time_secs, 0));
+    std::thread::sleep(Duration::new(args.time_secs, 0));
     finished.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let mut overall = RunDetails {
@@ -95,7 +125,7 @@ fn main() {
             overall.successes += details.successes;
             overall.failures += details.failures;
         } else {
-            break;
+            eprintln!("Some statistics never made it to the main thread!");
         }
     }
 
@@ -103,16 +133,16 @@ fn main() {
         handle.join().unwrap()
     }
 
-    println!("Nameserver: {}", nameserver);
-    println!("Host: {}", host);
-    println!(
-        "Successes: {}, Failures: {}",
-        overall.successes, overall.failures
-    );
+    println!("Nameserver: {}", args.nameserver);
+    println!("Host: {}", args.host);
+    println!("CPUs Used: {}", args.cpus);
+    println!("Total threads consumed: {}", thread_count);
+    println!("Successes: {}", overall.successes);
+    println!("Failures: {}", overall.failures);
     println!(
         "Success Rate: {:.02}%",
         (overall.successes as f64 / (overall.successes + overall.failures) as f64) * 100.0,
     );
-    println!("Runtime: {}s", time_secs);
-    println!("Requests: {}/s", overall.successes / time_secs);
+    println!("Runtime: {}s", args.time_secs);
+    println!("Requests: {}/s", overall.successes / args.time_secs);
 }
