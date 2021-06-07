@@ -91,7 +91,7 @@ fn perform_queries(
         }
     }
 
-    informer_finished_parent.store(true, std::sync::atomic::Ordering::Release);
+    informer_finished_parent.store(true, std::sync::atomic::Ordering::Relaxed);
     informer.join().unwrap();
 }
 
