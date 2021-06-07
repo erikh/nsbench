@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    ops::AddAssign,
     sync::{
         atomic::AtomicBool,
         mpsc::{channel, sync_channel, Sender, SyncSender},
@@ -21,6 +22,32 @@ struct RunDetails {
     successes: u64,
     failures: u64,
     duration: u128,
+}
+
+impl RunDetails {
+    fn reset(&mut self) {
+        self.successes = 0;
+        self.failures = 0;
+        self.duration = 0;
+    }
+}
+
+impl Default for RunDetails {
+    fn default() -> Self {
+        Self {
+            successes: 0,
+            failures: 0,
+            duration: 0,
+        }
+    }
+}
+
+impl AddAssign<RunDetails> for RunDetails {
+    fn add_assign(&mut self, rhs: RunDetails) {
+        self.duration = (rhs.duration + self.duration) / 2;
+        self.successes += rhs.successes;
+        self.failures += rhs.failures;
+    }
 }
 
 fn perform_queries(
@@ -47,12 +74,7 @@ fn perform_queries(
 
     let resolver = Resolver::new(resolver_config, opts).unwrap();
 
-    let ret = RunDetails {
-        successes: 0,
-        failures: 0,
-        duration: 0,
-    };
-
+    let ret = RunDetails::default();
     let details = Arc::new(Mutex::new(ret));
 
     let informer_details = details.clone();
@@ -65,9 +87,7 @@ fn perform_queries(
             thread::sleep(tick);
             let mut details = informer_details.lock().unwrap();
             informer_sender.send(details.clone()).unwrap();
-            details.successes = 0;
-            details.failures = 0;
-            details.duration = 0;
+            details.reset();
         }
     });
 
@@ -159,22 +179,13 @@ fn main() {
     }
 
     let informer = thread::spawn(move || {
-        let mut totals = RunDetails {
-            successes: 0,
-            failures: 0,
-            duration: 0,
-        };
-
+        let mut totals = RunDetails::default();
+        let mut temp_total = RunDetails::default();
         let mut start = Instant::now();
-        let mut temp_total = totals.clone();
         while let Ok(details) = inf_r.recv() {
-            totals.duration = (details.duration + totals.duration) / 2;
-            totals.successes += details.successes;
-            totals.failures += details.failures;
+            totals += details;
+            temp_total += details;
 
-            temp_total.duration = (details.duration + totals.duration) / 2;
-            temp_total.successes += details.successes;
-            temp_total.failures += details.failures;
             if Instant::now().duration_since(start).as_secs() > 1 {
                 eprintln!(
                     "1s latency: {:?} | Successes: {} | Failures: {} | Total Req: {}",
@@ -185,11 +196,7 @@ fn main() {
                 );
 
                 start = Instant::now();
-                temp_total = RunDetails {
-                    successes: 0,
-                    failures: 0,
-                    duration: 0,
-                };
+                temp_total = RunDetails::default();
             }
         }
 
