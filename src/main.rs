@@ -74,6 +74,10 @@ fn perform_queries(qc: QueryConfig) {
     opts.rotate = false;
     opts.cache_size = 0;
     opts.timeout = qc.timeout;
+    opts.positive_min_ttl = Some(Duration::new(0, 0));
+    opts.positive_max_ttl = Some(Duration::new(0, 0));
+    opts.negative_min_ttl = Some(Duration::new(0, 0));
+    opts.negative_max_ttl = Some(Duration::new(0, 0));
 
     let resolver = Resolver::new(resolver_config, opts).unwrap();
 
