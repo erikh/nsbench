@@ -1,5 +1,5 @@
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::SocketAddr,
     ops::AddAssign,
     sync::{
         atomic::AtomicBool,
@@ -22,7 +22,7 @@ struct QueryConfig {
     init_done: SyncSender<()>,
     informer_sender: Sender<RunDetails>,
     finished: Arc<AtomicBool>,
-    nameserver: IpAddr,
+    nameserver: SocketAddr,
     host: Name,
     timeout: Duration,
     lock: Arc<Mutex<()>>,
@@ -55,8 +55,10 @@ impl Default for RunDetails {
 
 impl AddAssign<RunDetails> for RunDetails {
     fn add_assign(&mut self, rhs: RunDetails) {
-        self.duration = (rhs.duration + self.duration) / 2;
         self.successes += rhs.successes;
+        if self.successes > 0 {
+            self.duration = (rhs.duration + self.duration) / self.successes as u128;
+        }
         self.failures += rhs.failures;
     }
 }
@@ -64,7 +66,7 @@ impl AddAssign<RunDetails> for RunDetails {
 fn perform_queries(qc: QueryConfig) {
     let mut resolver_config = ResolverConfig::new();
     resolver_config.add_name_server(NameServerConfig {
-        socket_addr: SocketAddr::new(qc.nameserver, 53),
+        socket_addr: qc.nameserver,
         protocol: trust_dns_resolver::config::Protocol::Udp,
         tls_dns_name: None,
         trust_nx_responses: true,
@@ -114,9 +116,8 @@ fn perform_queries(qc: QueryConfig) {
         {
             let mut writer = details.lock().unwrap();
             writer.successes += 1;
-            let previous = writer.duration;
             let current = Instant::now().duration_since(now).as_nanos();
-            writer.duration = (current + previous) / 2;
+            writer.duration += current;
         } else {
             let mut writer = details.lock().unwrap();
             writer.failures += 1
@@ -149,14 +150,17 @@ struct CLIArguments {
     #[argh(
         option,
         description = "duration to wait (in ns) before considering a request failed",
-        default = "500000"
+        default = "100000000"
     )]
     timeout: u32,
 
-    #[argh(positional)]
-    nameserver: IpAddr,
+    #[argh(
+        positional,
+        description = "socketaddr (127.0.0.1:53) to contact for DNS queries"
+    )]
+    nameserver: SocketAddr,
 
-    #[argh(positional)]
+    #[argh(positional, description = "hostname to request A records for")]
     host: Name,
 }
 
@@ -200,7 +204,7 @@ fn main() {
 
             if Instant::now().duration_since(start).as_secs() > 1 {
                 eprintln!(
-                    "1s latency: {:?} | Successes: {} | Failures: {} | Total Req: {}",
+                    "1s avg latency: {:?} | Successes: {} | Failures: {} | Total Req: {}",
                     Duration::from_nanos(temp_total.duration as u64),
                     temp_total.successes,
                     temp_total.failures,
