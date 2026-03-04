@@ -4,7 +4,7 @@ mod metrics;
 mod report;
 mod worker;
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,8 +67,8 @@ struct CliArgs {
     #[argh(switch, description = "output results as JSON")]
     json: bool,
 
-    #[argh(positional, description = "nameserver address (e.g., 8.8.8.8:53)")]
-    nameserver: SocketAddr,
+    #[argh(positional, description = "nameserver address (e.g., 8.8.8.8 or 8.8.8.8:5353)")]
+    nameserver: String,
 
     #[argh(positional, description = "hostname to query (e.g., example.com)")]
     host: Name,
@@ -78,6 +78,17 @@ fn default_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1)
+}
+
+fn parse_nameserver(s: &str) -> SocketAddr {
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return addr;
+    }
+    if let Ok(ip) = s.parse::<IpAddr>() {
+        return SocketAddr::new(ip, 53);
+    }
+    eprintln!("invalid nameserver address: {s}");
+    std::process::exit(1);
 }
 
 fn parse_record_type(s: &str) -> RecordType {
@@ -101,8 +112,10 @@ fn parse_record_type(s: &str) -> RecordType {
 async fn main() {
     let args: CliArgs = argh::from_env();
 
+    let nameserver = parse_nameserver(&args.nameserver);
+
     let config = Arc::new(BenchConfig {
-        nameserver: args.nameserver,
+        nameserver,
         host: args.host,
         record_type: parse_record_type(&args.record_type),
         protocol: args.protocol,
