@@ -1,247 +1,157 @@
-use std::{
-    net::SocketAddr,
-    ops::AddAssign,
-    sync::{
-        atomic::AtomicBool,
-        mpsc::{channel, sync_channel, Sender, SyncSender},
-        Arc, Mutex,
-    },
-    thread,
-    time::{Duration, Instant},
-};
+mod config;
+mod dns;
+mod metrics;
+mod report;
+mod worker;
 
-use trust_dns_resolver::{
-    config::{NameServerConfig, ResolverConfig, ResolverOpts},
-    Name, Resolver,
-};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use argh::FromArgs;
+use hickory_proto::rr::{Name, RecordType};
 
-#[derive(Debug, Clone)]
-struct QueryConfig {
-    init_done: SyncSender<()>,
-    informer_sender: Sender<RunDetails>,
-    finished: Arc<AtomicBool>,
-    nameserver: SocketAddr,
-    host: Name,
-    timeout: Duration,
-    lock: Arc<Mutex<()>>,
-}
+use crate::config::{BenchConfig, Protocol};
+use crate::metrics::{merge_worker_results, LiveCounters};
 
-#[derive(Clone, Copy, Debug)]
-struct RunDetails {
-    successes: u64,
-    failures: u64,
-    duration: u128,
-}
-
-impl RunDetails {
-    fn reset(&mut self) {
-        self.successes = 0;
-        self.failures = 0;
-        self.duration = 0;
-    }
-}
-
-impl Default for RunDetails {
-    fn default() -> Self {
-        Self {
-            successes: 0,
-            failures: 0,
-            duration: 0,
-        }
-    }
-}
-
-impl AddAssign<RunDetails> for RunDetails {
-    fn add_assign(&mut self, rhs: RunDetails) {
-        self.successes += rhs.successes;
-        if self.successes > 0 {
-            self.duration = (rhs.duration + self.duration) / self.successes as u128;
-        }
-        self.failures += rhs.failures;
-    }
-}
-
-fn perform_queries(qc: QueryConfig) {
-    let mut resolver_config = ResolverConfig::new();
-    resolver_config.add_name_server(NameServerConfig {
-        socket_addr: qc.nameserver,
-        protocol: trust_dns_resolver::config::Protocol::Udp,
-        tls_dns_name: None,
-        trust_nx_responses: true,
-        bind_addr: None,
-    });
-
-    let mut opts = ResolverOpts::default();
-    opts.rotate = false;
-    opts.cache_size = 0;
-    opts.timeout = qc.timeout;
-    opts.positive_min_ttl = Some(Duration::new(0, 0));
-    opts.positive_max_ttl = Some(Duration::new(0, 0));
-    opts.negative_min_ttl = Some(Duration::new(0, 0));
-    opts.negative_max_ttl = Some(Duration::new(0, 0));
-
-    let resolver = Resolver::new(resolver_config, opts).unwrap();
-
-    let ret = RunDetails::default();
-    let details = Arc::new(Mutex::new(ret));
-
-    let informer_details = details.clone();
-    let informer_finished_parent = Arc::new(AtomicBool::new(false));
-    let informer_finished = informer_finished_parent.clone();
-    let informer_sender = qc.informer_sender.clone();
-
-    let informer = thread::spawn(move || {
-        let tick = std::time::Duration::new(1, 0);
-        while !informer_finished.load(std::sync::atomic::Ordering::Relaxed) {
-            thread::sleep(tick);
-            let mut details = informer_details.lock().unwrap();
-            informer_sender.send(details.clone()).unwrap();
-            details.reset();
-        }
-    });
-
-    qc.init_done.send(()).unwrap();
-    drop(qc.lock.lock().unwrap());
-
-    while !qc.finished.load(std::sync::atomic::Ordering::Relaxed) {
-        let now = Instant::now();
-        if resolver
-            .lookup(
-                qc.host.clone(),
-                trust_dns_resolver::proto::rr::RecordType::A,
-            )
-            .is_ok()
-        {
-            let mut writer = details.lock().unwrap();
-            writer.successes += 1;
-            let current = Instant::now().duration_since(now).as_nanos();
-            writer.duration += current;
-        } else {
-            let mut writer = details.lock().unwrap();
-            writer.failures += 1
-        }
-    }
-
-    informer_finished_parent.store(true, std::sync::atomic::Ordering::Relaxed);
-    informer.join().unwrap();
-}
-
-#[derive(FromArgs, Clone, Debug)]
-#[argh(description = "Nameserver benchmarking/flooding tool")]
-struct CLIArguments {
+#[derive(FromArgs)]
+#[argh(description = "DNS benchmarking tool")]
+struct CliArgs {
     #[argh(
         option,
         short = 't',
-        description = "time in seconds to run the test",
+        description = "time in seconds to run the benchmark",
         default = "60"
     )]
     time_secs: u64,
 
     #[argh(
         option,
-        short = 'l',
-        description = "limit the number of CPUs (default off)",
-        default = "num_cpus::get()"
+        short = 'w',
+        description = "number of worker tasks (default: CPU count)",
+        default = "default_workers()"
     )]
-    cpus: usize,
+    workers: usize,
 
     #[argh(
         option,
-        description = "duration to wait (in ns) before considering a request failed",
-        default = "100000000"
+        description = "query timeout in milliseconds",
+        default = "2000"
     )]
-    timeout: u32,
+    timeout: u64,
 
     #[argh(
-        positional,
-        description = "socketaddr (127.0.0.1:53) to contact for DNS queries"
+        option,
+        description = "warmup period in seconds",
+        default = "3"
     )]
+    warmup: u64,
+
+    #[argh(
+        option,
+        short = 'r',
+        description = "record type: A, AAAA, MX, TXT, CNAME, SRV, NS, SOA",
+        default = "\"A\".to_string()"
+    )]
+    record_type: String,
+
+    #[argh(
+        option,
+        short = 'p',
+        description = "protocol: udp, tcp",
+        default = "Protocol::Udp"
+    )]
+    protocol: Protocol,
+
+    #[argh(switch, description = "output results as JSON")]
+    json: bool,
+
+    #[argh(positional, description = "nameserver address (e.g., 8.8.8.8:53)")]
     nameserver: SocketAddr,
 
-    #[argh(positional, description = "hostname to request A records for")]
+    #[argh(positional, description = "hostname to query (e.g., example.com)")]
     host: Name,
 }
 
-fn main() {
-    let args: CLIArguments = argh::from_env();
+fn default_workers() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+}
 
-    let mut handles = Vec::new();
-    let (s, r) = sync_channel(args.cpus);
-    let (init_s, init_r) = sync_channel(args.cpus);
-    let (inf_s, inf_r) = channel();
-    let finished = Arc::new(AtomicBool::new(false));
-    let lock = Arc::new(Mutex::new(()));
-
-    let mg = lock.lock().unwrap();
-
-    for _ in 0..args.cpus {
-        let qc = QueryConfig {
-            init_done: init_s.clone(),
-            informer_sender: inf_s.clone(),
-            finished: finished.clone(),
-            nameserver: args.nameserver.clone(),
-            host: args.host.clone(),
-            timeout: Duration::new(0, args.timeout),
-            lock: lock.clone(),
-        };
-
-        handles.push(std::thread::spawn(move || perform_queries(qc)));
-    }
-
-    for _ in 0..args.cpus {
-        init_r.recv().unwrap();
-    }
-
-    let informer = thread::spawn(move || {
-        let mut totals = RunDetails::default();
-        let mut temp_total = RunDetails::default();
-        let mut start = Instant::now();
-        while let Ok(details) = inf_r.recv() {
-            totals += details;
-            temp_total += details;
-
-            if Instant::now().duration_since(start).as_secs() > 1 {
-                eprintln!(
-                    "1s avg latency: {:?} | Successes: {} | Failures: {} | Total Req: {}",
-                    Duration::from_nanos(temp_total.duration as u64),
-                    temp_total.successes,
-                    temp_total.failures,
-                    temp_total.successes + temp_total.failures,
-                );
-
-                start = Instant::now();
-                temp_total = RunDetails::default();
-            }
+fn parse_record_type(s: &str) -> RecordType {
+    match s.to_uppercase().as_str() {
+        "A" => RecordType::A,
+        "AAAA" => RecordType::AAAA,
+        "MX" => RecordType::MX,
+        "TXT" => RecordType::TXT,
+        "CNAME" => RecordType::CNAME,
+        "SRV" => RecordType::SRV,
+        "NS" => RecordType::NS,
+        "SOA" => RecordType::SOA,
+        _ => {
+            eprintln!("unsupported record type: {s}");
+            std::process::exit(1);
         }
+    }
+}
 
-        s.send(totals).unwrap()
+#[tokio::main]
+async fn main() {
+    let args: CliArgs = argh::from_env();
+
+    let config = Arc::new(BenchConfig {
+        nameserver: args.nameserver,
+        host: args.host,
+        record_type: parse_record_type(&args.record_type),
+        protocol: args.protocol,
+        duration: Duration::from_secs(args.time_secs),
+        timeout: Duration::from_millis(args.timeout),
+        workers: args.workers,
+        warmup: Duration::from_secs(args.warmup),
+        json: args.json,
     });
 
-    drop(mg);
+    let finished = Arc::new(AtomicBool::new(false));
+    let live = Arc::new(LiveCounters::new());
+    let warmup_deadline = Instant::now() + config.warmup;
 
-    std::thread::sleep(Duration::new(args.time_secs, 0));
-    finished.store(true, std::sync::atomic::Ordering::Release);
-
-    for handle in handles {
-        handle.join().unwrap()
+    let mut worker_handles = Vec::new();
+    for _ in 0..config.workers {
+        let config = config.clone();
+        let live = live.clone();
+        let finished = finished.clone();
+        worker_handles.push(tokio::spawn(worker::worker(
+            config,
+            live,
+            finished,
+            warmup_deadline,
+        )));
     }
 
-    drop(inf_s);
-    informer.join().unwrap();
+    let informer_handle = tokio::spawn(report::informer(
+        live.clone(),
+        finished.clone(),
+        config.warmup,
+    ));
 
-    let overall = r.recv().unwrap();
+    tokio::time::sleep(config.warmup + config.duration).await;
+    finished.store(true, Ordering::Release);
 
-    println!("Nameserver: {}", args.nameserver);
-    println!("Host: {}", args.host);
-    println!("CPUs Used: {}", args.cpus);
-    println!("Successes: {}", overall.successes);
-    println!("Failures: {}", overall.failures);
-    println!(
-        "Success Rate: {:.02}%",
-        (overall.successes as f64 / (overall.successes + overall.failures) as f64) * 100.0,
-    );
-    println!("Runtime: {}s", args.time_secs);
-    println!("Requests: {}/s", overall.successes / args.time_secs);
+    let mut worker_results = Vec::new();
+    for handle in worker_handles {
+        worker_results.push(handle.await.expect("worker task panicked"));
+    }
+
+    informer_handle.abort();
+    let _ = informer_handle.await;
+
+    let merged = merge_worker_results(worker_results);
+
+    if config.json {
+        report::print_json_report(&config, &merged);
+    } else {
+        report::print_report(&config, &merged);
+    }
 }
