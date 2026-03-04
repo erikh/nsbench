@@ -1,58 +1,89 @@
-# nsbench: a tool I cobbled together to load test/benchmark DNS servers
+# nsbench
 
-Also a great way to learn thread-based concurrency in rust!
+A high-performance DNS server benchmarking tool built in Rust.
 
-I don't really guarantee anything about this software. It can generate a lot of load, though! I built it to help me evaluate performance issues with [zeronsd](https://github.com/zerotier/zeronsd).
+`nsbench` spawns async [Tokio](https://tokio.rs/) worker tasks to flood a DNS server with queries for a fixed duration, recording per-query latency in an [HdrHistogram](https://docs.rs/hdrhistogram) and categorizing errors. It uses [hickory-proto](https://docs.rs/hickory-proto) for DNS wire protocol over UDP or TCP.
 
-`nsbench` will allocate N threads (where N defaults to the number of CPUs) to repeatedly hammer your DNS server for a fixed period of time (default 60 seconds). It will periodically report on a number of things, like latency. Once finished, it will offer a detailed report of the run status.
-
-## Output Examples:
+## Installation
 
 ```
-% ./target/release/nsbench 172.29.194.254 islay.domain -t 10 -l 12
-1s latency: 85.576µs | Successes: 253572 | Failures: 0 | Total Req: 253572
-1s latency: 95.595µs | Successes: 230841 | Failures: 0 | Total Req: 230841
-1s latency: 87.506µs | Successes: 241420 | Failures: 0 | Total Req: 241420
-1s latency: 93.204µs | Successes: 251606 | Failures: 0 | Total Req: 251606
-1s latency: 98.136µs | Successes: 252773 | Failures: 0 | Total Req: 252773
-Nameserver: 172.29.194.254
-Host: islay.domain
-CPUs Used: 12
-Successes: 1319050
-Failures: 0
-Success Rate: 100.00%
-Runtime: 10s
-Requests: 131905/s
+cargo install nsbench
 ```
 
-## Installation:
-
-I'll make a crate when it's more useful.
+Or from source:
 
 ```
 cargo install --git https://github.com/erikh/nsbench --branch main
 ```
 
-## Usage:
+## Usage
 
 ```
-nsbench <nameserver ip> <host>
+nsbench <nameserver> <host> [options]
 ```
 
-There are other flags. Use `--help` to access them. As of this writing, that looks like this:
+A bare IP address defaults to port 53. You can also specify a port explicitly (e.g., `8.8.8.8:5353`).
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-t <secs>` | Duration in seconds | 60 |
+| `-w <n>` | Number of worker tasks | CPU count |
+| `--warmup <secs>` | Warmup period (excluded from results) | 3 |
+| `--timeout <ms>` | Query timeout in milliseconds | 2000 |
+| `-r <type>` | Record type: A, AAAA, MX, TXT, CNAME, SRV, NS, SOA | A |
+| `-p <proto>` | Protocol: udp, tcp | udp |
+| `--json` | Output results as JSON | off |
+
+### Example
 
 ```
-Usage: nsbench <nameserver> <host> [-t <time-secs>] [-l <cpus>] [--timeout <timeout>]
+$ nsbench 8.8.8.8 example.com -t 10 -w 8
+[warmup]   1s | qps: 12,340 | errors: 0
+[warmup]   2s | qps: 13,002 | errors: 0
+[warmup]   3s | qps: 12,870 | errors: 0
+        4s | qps: 13,150 | errors: 0
+        5s | qps: 12,980 | errors: 0
+        6s | qps: 13,210 | errors: 0
+        7s | qps: 12,750 | errors: 0
+        8s | qps: 13,100 | errors: 0
+        9s | qps: 12,900 | errors: 0
+       10s | qps: 13,050 | errors: 0
+       11s | qps: 12,800 | errors: 0
+       12s | qps: 13,000 | errors: 0
+       13s | qps: 12,950 | errors: 0
+--- nsbench results ---
+Target:     8.8.8.8:53
+Hostname:   example.com.
+Record:     A
+Protocol:   UDP
+Workers:    8
+Duration:   10s (3s warmup excluded)
 
-Nameserver benchmarking/flooding tool
+Queries:
+  Total:      129,890
+  Successful: 129,890
+  Failed:     0
+  QPS:        12,989
 
-Options:
-  -t, --time-secs   time in seconds to run the test
-  -l, --cpus        limit the number of CPUs (default off)
-  --timeout         duration to wait (in ns) before considering a request failed
-  --help            display usage information
+Latency:
+  Mean:       602.3µs    Min:       98.0µs
+  p50:        580.0µs    p95:        1.12ms
+  p99:         2.45ms    p99.9:      5.80ms
+  Max:         8.32ms
+
+Errors:
+  Timeouts: 0  SERVFAIL: 0  REFUSED: 0
+  NXDOMAIN: 0   Network: 0   Other: 0
+
+Success Rate: 100.0000%
 ```
 
 ## Author
 
 Erik Hollensbe <github@hollensbe.org>
+
+## License
+
+[MIT](LICENSE)
